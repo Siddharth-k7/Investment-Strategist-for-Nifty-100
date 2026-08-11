@@ -1,0 +1,35 @@
+Nifty 100 Financial Intelligence Platform — Overview
+It's a Django-based analytics platform that ingests raw financial statements for all 100 Nifty 100 companies, scores their financial health with a rules-based ML model, and exposes the results through a dashboard, a screener, and a REST API. Four layers:
+
+1. ETL pipeline (etl/)
+
+01_extract_from_mysql.py — reads 7 raw Excel workbooks (P&L, balance sheet, cash flow, analysis, companies, documents, pros/cons) into raw CSVs.
+02_clean_and_transform.py — reshapes them into a star schema: dimension tables (dim_company, dim_year, dim_sector, dim_health_label) plus fact tables (fact_profit_loss, fact_balance_sheet, fact_cash_flow, fact_analysis, fact_pros_cons). It also derives ratios here — debt-to-equity, equity ratio, free cash flow, interest coverage, net profit margin, etc.
+03_load_to_warehouse.py — idempotent upsert into PostgreSQL (optional; the web app itself reads straight from the data/clean/*.csv files via apps/companies/services.py, so Postgres isn't required to run the dashboard).
+2. ML health scoring (apps/ml_engine/scoring.py)
+Not a trained model — a transparent, percentile-based composite score. For each company it takes the latest non-TTM year of financials and:
+
+Percentile-ranks each metric against all 100 companies (_pct_rank) — e.g. a company with the 90th-highest net profit margin scores ~90 on that sub-metric. Ratios where lower is better (debt-to-equity) get inverted (100 - rank).
+Rolls sub-metrics into 6 dimension scores: profitability (NPM, ROA, OPM), growth (3Y sales/profit CAGR, ROE), leverage (D/E, equity ratio, interest coverage), cash flow (FCF, cash conversion ratio), dividend (payout %), trend (5Y vs 3Y sales growth consistency).
+Weights them into one overall_score (0–100): profitability 25%, growth 20%, leverage 20%, cash flow 20%, dividend 8%, trend 7%.
+Buckets the score into a label: EXCELLENT ≥85, GOOD ≥70, AVERAGE ≥50, WEAK ≥30, POOR <30.
+This writes fact_ml_scores.csv, which the dashboard, screener, and leaderboard all read.
+
+3. Screening (apps/dashboard/views.py:223-304)
+The /screener/ page is plain server-side filtering over the pre-computed scores and financials — no separate "screening model." For every company it pulls the ML score, 3-year ROE/sales-growth (from fact_analysis), and latest NPM/D-E (from fact_profit_loss/fact_balance_sheet), then applies whatever filters came in via query params: sector, health label, min ROE, max D/E, min sales growth, min NPM. Anything that fails a filter is skipped with a continue; survivors are sorted by overall_score descending. So "screening" = filter the already-scored universe down to companies matching your criteria, ranked by health score.
+
+4. Dashboard, API, notebooks
+
+Dashboard (apps/dashboard/): home, company list, company detail (8 Chart.js charts), sector view, compare (up to 4 companies side by side), screener, leaderboard.
+REST API (apps/api/): DRF endpoints mirroring the same data, documented via Swagger at /api/docs/; plus a separate HMAC-authenticated partner API (apps/api_management/) with tiered rate limits.
+Power BI specs (powerbi/): connection guide, DAX measures, dashboard specs — for consuming the same warehouse in Power BI instead of the Django UI.
+EDA notebook — notebooks/01_eda_overview.ipynb
+This is exploratory, not part of the scoring pipeline — it's meant to be run manually after the ETL stages, to sanity-check and understand the data before/alongside building the scoring model. It loads the clean star-schema CSVs and produces:
+
+Companies by sector — horizontal bar chart, sanity-checks sector coverage.
+Net profit margin distribution — histogram of NPM% across all 100 companies for the latest reporting year (filters out TTM rows first), plus .describe() stats — gives a feel for where "good" vs "average" margins actually sit before hard-coding score thresholds.
+Sector average KPI heatmap — mean OPM/NPM/ROA per sector, shows which sectors are structurally more profitable (useful context since the scoring engine ranks companies within the whole universe, not sector-adjusted).
+Revenue trend, top 10 by sales — line chart over years, checks that time-series data parses/sorts correctly.
+Debt-to-equity distribution — histogram capped at 5x to see the leverage spread (this directly informs why leverage is inverse-ranked in scoring — most companies cluster low, with a long right tail of highly leveraged outliers).
+Free cash flow vs net profit scatter — flags companies with profit but negative FCF (accrual vs cash divergence) — the kind of thing the "cashflow" scoring dimension is meant to catch.
+It's the first of six notebooks — the later ones (02_ml_scoring_analysis, 03_anomaly_detection, 04_sector_clustering, 05_peer_comparison, 06_trend_forecasting) build on top of this: they run the scoring engine, do anomaly detection (Z-score + Isolation Forest), K-Means sector clustering, cosine-similarity peer matching, and ARIMA revenue forecasts respectively — all writing their own CSVs back into data/clean/ that the ETL/scoring layer doesn't otherwise produce.
